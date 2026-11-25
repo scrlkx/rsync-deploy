@@ -93,7 +93,13 @@ fi
 
 umask 077
 workdir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rsync-deploy.XXXXXX")
+# A cancelled or timed-out job gets SIGINT/SIGTERM. Bash already runs the EXIT
+# trap on those, but exiting explicitly keeps the cleanup guaranteed without
+# relying on that, and stops the script instead of resuming after the signal.
+# SIGKILL can't be trapped; $RUNNER_TEMP is wiped at the end of the job anyway.
 trap 'rm -rf "$workdir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 normalize "$key" >"$workdir/key"
 {
