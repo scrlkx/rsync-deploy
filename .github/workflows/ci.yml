@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check shell scripts
+        run: shellcheck deploy.sh test/*.sh test/sshd/entrypoint.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+
+    env:
+      SOURCE: ${{ github.workspace }}/../e2e-source
+      EXCL_SOURCE: ${{ github.workspace }}/../e2e-excl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Start the proxy and target SSH servers
+        run: test/setup.sh
+
+      - name: Record ~/.ssh before the action runs
+        run: test/snapshot-ssh.sh
+
+      - name: Create the source directory
+        run: |
+          mkdir -p "$SOURCE/sub"
+          echo one > "$SOURCE/one.txt"
+          echo two > "$SOURCE/sub/two.txt"
+          echo remove > "$SOURCE/remove.txt"
+
+      - name: The target is not reachable from the runner
+        run: |
+          if getent hosts target; then
+            echo "target should only resolve from the proxy" >&2
+            exit 1
+          fi
+
+      # 1. Direct, without proxy (the proxy container is the destination)
+      - name: "Case 1: send directly"
+        id: direct
+        uses: ./
+        with:
+          host: 127.0.0.1
+          port: 2222
+          username: deploy
+          key: ${{ env.PROXY_KEY }}
+          known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: ~/direct
+
+      - name: "Case 1: files arrived"
+        run: |
+          test "${{ steps.direct.outputs.files_transferred }}" = 3
+          test "$(docker exec rsync-proxy cat /home/deploy/direct/one.txt)" = one
+          test "$(docker exec rsync-proxy cat /home/deploy/direct/sub/two.txt)" = two
+
+      - name: "Case 8: nothing left behind after a successful run"
+        run: test/check-cleanup.sh
+
+      # 2. Through the proxy, with a different key on each hop
+      - name: "Case 2: send through the proxy"
+        id: proxy
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.TARGET_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: /home/deploy/site/nested
+
+      - name: "Case 2: files arrived"
+        run: |
+          test "${{ steps.proxy.outputs.files_transferred }}" = 3
+          test "$(docker exec rsync-target cat /home/deploy/site/nested/one.txt)" = one
+          test "$(docker exec rsync-target cat /home/deploy/site/nested/sub/two.txt)" = two
+          test "$(docker exec rsync-target cat /home/deploy/site/nested/remove.txt)" = remove
+
+      # 3. No changes, but new modification times (like a fresh dependency install)
+      - name: "Case 3: touch the source files"
+        run: find "$SOURCE" -type f -exec touch {} +
+
+      - name: "Case 3: send again without changes"
+        id: unchanged
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.TARGET_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: /home/deploy/site/nested
+
+      - name: "Case 3: no file was transferred"
+        run: test "${{ steps.unchanged.outputs.files_transferred }}" = 0
+
+      # 4. A file removed from the source is removed from the target
+      - name: "Case 4: remove a file from the source"
+        run: rm "$SOURCE/remove.txt"
+
+      - name: "Case 4: send after the removal"
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.TARGET_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: /home/deploy/site/nested
+
+      - name: "Case 4: the file is gone from the target"
+        run: |
+          if docker exec rsync-target test -e /home/deploy/site/nested/remove.txt; then
+            echo "remove.txt should have been deleted" >&2
+            exit 1
+          fi
+          docker exec rsync-target test -f /home/deploy/site/nested/one.txt
+
+      # 5. Wrong host keys
+      - name: "Case 5: wrong known_hosts for the target"
+        id: wrong_target
+        continue-on-error: true
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.WRONG_TARGET_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: /home/deploy/site/wrong-target
+
+      - name: "Case 5: wrong known_hosts for the proxy"
+        id: wrong_proxy
+        continue-on-error: true
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.WRONG_PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.TARGET_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: /home/deploy/site/wrong-proxy
+
+      - name: "Case 5: both runs failed and sent nothing"
+        run: |
+          test "${{ steps.wrong_target.outcome }}" = failure
+          test "${{ steps.wrong_proxy.outcome }}" = failure
+          if docker exec rsync-target test -e /home/deploy/site/wrong-target; then exit 1; fi
+          if docker exec rsync-target test -e /home/deploy/site/wrong-proxy; then exit 1; fi
+
+      - name: "Case 8: nothing left behind after a failed run"
+        run: test/check-cleanup.sh
+
+      # 6. exclude and exclude_from
+      - name: "Case 6: create server-only files and the source"
+        run: |
+          docker exec -u deploy rsync-target sh -c '
+            mkdir -p /home/deploy/excl/keep /home/deploy/excl/uploads
+            echo server > /home/deploy/excl/keep/server.log
+            echo server > /home/deploy/excl/uploads/photo.jpg
+            echo stale > /home/deploy/excl/stale.txt
+          '
+
+          mkdir -p "$EXCL_SOURCE"/{keep,uploads,frontend/node_modules,.git}
+          echo app > "$EXCL_SOURCE/app.txt"
+          echo source > "$EXCL_SOURCE/keep/source.txt"
+          echo source > "$EXCL_SOURCE/uploads/source.txt"
+          echo app > "$EXCL_SOURCE/frontend/app.js"
+          echo lib > "$EXCL_SOURCE/frontend/node_modules/lib.js"
+          echo ref > "$EXCL_SOURCE/.git/HEAD"
+          printf 'uploads\n.rsync-exclude\n' > "$EXCL_SOURCE/.rsync-exclude"
+
+      - name: "Case 6: send with exclude and exclude_from"
+        uses: ./
+        with:
+          proxy_host: 127.0.0.1
+          proxy_port: 2222
+          proxy_username: deploy
+          proxy_key: ${{ env.PROXY_KEY }}
+          proxy_known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          host: target
+          username: deploy
+          key: ${{ env.TARGET_KEY }}
+          known_hosts: ${{ env.TARGET_KNOWN_HOSTS }}
+          source: ${{ env.EXCL_SOURCE }}
+          target: /home/deploy/excl
+          exclude_from: .rsync-exclude
+          exclude: |
+            .git
+            keep
+            frontend/node_modules
+
+      - name: "Case 6: excluded paths skipped, server files kept"
+        run: |
+          expected=$(printf '%s\n' \
+            /home/deploy/excl/app.txt \
+            /home/deploy/excl/frontend/app.js \
+            /home/deploy/excl/keep/server.log \
+            /home/deploy/excl/uploads/photo.jpg)
+          actual=$(docker exec rsync-target find /home/deploy/excl -type f | sort)
+          echo "$actual"
+          test "$actual" = "$expected"
+
+      # 7. exclude_from pointing to a missing file
+      - name: "Case 7: exclude_from points to a missing file"
+        id: missing_exclude
+        continue-on-error: true
+        uses: ./
+        with:
+          host: 127.0.0.1
+          port: 2222
+          username: deploy
+          key: ${{ env.PROXY_KEY }}
+          known_hosts: ${{ env.PROXY_KNOWN_HOSTS }}
+          source: ${{ env.SOURCE }}
+          target: ~/missing-exclude
+          exclude_from: .does-not-exist
+
+      - name: "Case 7: the run failed and sent nothing"
+        run: |
+          test "${{ steps.missing_exclude.outcome }}" = failure
+          if docker exec rsync-proxy test -e /home/deploy/missing-exclude; then exit 1; fi
+
+      # 8. Final cleanup check, whatever happened above
+      - name: "Case 8: nothing left behind at the end"
+        if: always()
+        run: test/check-cleanup.sh
+
+      - name: Stop the SSH servers
+        if: always()
+        run: test/teardown.sh

@@ -1,0 +1,94 @@
+name: "rsync Deploy"
+description: "Sends files to a server with rsync over SSH, incrementally, with jump host support and strict host key checking on every hop."
+author: "scrlkx <me@scrlkx.com>"
+
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  host:
+    description: "Target server host, as seen from the runner (or from the proxy, when there is one)"
+    required: true
+  port:
+    description: "Target server SSH port"
+    required: false
+    default: "22"
+  username:
+    description: "Target server SSH user"
+    required: true
+  key:
+    description: "Private key for the target server"
+    required: true
+  known_hosts:
+    description: >
+      known_hosts line(s) for the target server. Get them with
+      "ssh-keyscan -p <port> <host>" from a machine that can reach it.
+    required: true
+  proxy_host:
+    description: "SSH proxy (jump host). When empty, connects to the target directly"
+    required: false
+    default: ""
+  proxy_port:
+    description: "SSH proxy port"
+    required: false
+    default: "22"
+  proxy_username:
+    description: "SSH proxy user"
+    required: false
+    default: ""
+  proxy_key:
+    description: "Private key for the SSH proxy. It can differ from the target key"
+    required: false
+    default: ""
+  proxy_known_hosts:
+    description: "known_hosts line(s) for the SSH proxy. Required when proxy_host is set"
+    required: false
+    default: ""
+  source:
+    description: "Local directory to send. Its contents are mirrored into target"
+    required: false
+    default: "./"
+  target:
+    description: >
+      Remote directory that mirrors source. Created if missing. Files in it that
+      aren't in source are deleted, except excluded paths.
+    required: true
+  exclude:
+    description: "Paths to exclude, one per line, in rsync pattern format (e.g., .git)"
+    required: false
+    default: ""
+  exclude_from:
+    description: >
+      Path, relative to source, of an exclude file in rsync format (e.g.,
+      .rsync-exclude). The action fails if the file doesn't exist.
+    required: false
+    default: ""
+
+outputs:
+  files_transferred:
+    description: "Number of regular files rsync transferred (0 when nothing changed)"
+    value: ${{ steps.deploy.outputs.files_transferred }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Send files with rsync
+      id: deploy
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/deploy.sh"
+      env:
+        INPUT_HOST: ${{ inputs.host }}
+        INPUT_PORT: ${{ inputs.port }}
+        INPUT_USERNAME: ${{ inputs.username }}
+        INPUT_KEY: ${{ inputs.key }}
+        INPUT_KNOWN_HOSTS: ${{ inputs.known_hosts }}
+        INPUT_PROXY_HOST: ${{ inputs.proxy_host }}
+        INPUT_PROXY_PORT: ${{ inputs.proxy_port }}
+        INPUT_PROXY_USERNAME: ${{ inputs.proxy_username }}
+        INPUT_PROXY_KEY: ${{ inputs.proxy_key }}
+        INPUT_PROXY_KNOWN_HOSTS: ${{ inputs.proxy_known_hosts }}
+        INPUT_SOURCE: ${{ inputs.source }}
+        INPUT_TARGET: ${{ inputs.target }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_EXCLUDE_FROM: ${{ inputs.exclude_from }}
