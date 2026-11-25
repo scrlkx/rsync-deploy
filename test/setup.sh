@@ -65,6 +65,19 @@ emit() {
     fi
 }
 
+# Mask the private keys line by line, like GitHub does with real secrets, so the
+# step env blocks don't print them.
+if [ -n "${GITHUB_ENV:-}" ]; then
+    for file in "$dir/proxy_key" "$dir/target_key"; do
+        while IFS= read -r line; do
+            case "$line" in
+                "-----"*) ;;
+                ?*) echo "::add-mask::$line" ;;
+            esac
+        done <"$file"
+    done
+fi
+
 emit PROXY_KEY "$(cat "$dir/proxy_key")"
 emit TARGET_KEY "$(cat "$dir/target_key")"
 emit PROXY_KNOWN_HOSTS "[127.0.0.1]:2222 $(host_key rsync-proxy)"
